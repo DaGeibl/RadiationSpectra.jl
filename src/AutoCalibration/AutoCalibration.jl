@@ -96,9 +96,9 @@ function _filter_peaks_from_peakfinder(h::Histogram{<:Real, 1}, peakPositions::V
             right_point1 = (getindex(h_search.edges[1], cut_right_arg-1), h_search.weights[cut_right_arg-1])
             right_point2 = (getindex(h_search.edges[1], cut_right_arg), h_search.weights[cut_right_arg])
             cut_right = _interpolate_linear(right_point1, right_point2; threshold=threshold)
-            σ = (cut_right -  cut_left) * inv(2*√(2log(2)))
+            peak_σ = (cut_right -  cut_left) * inv(2*√(2log(2)))
             success[ipf] = true
-            pfits[ipf] = (μ = μ, σ = σ)
+            pfits[ipf] = (μ = μ, σ = peak_σ)
         catch e
             @debug "Error filter peak at $p: $e"
         end
