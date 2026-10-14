@@ -72,6 +72,12 @@ Two-match discovery permits ambiguous partial reference series (e.g. SiPM peaks)
 """
 function determine_calibration_constant_through_peak_ratios(fPositionX::Array{<:Real,1}, photon_lines::Array{<:Real,1};
         α::Real=0.01, rtol::Real=5e-3, min_n_matches::Int=min(4, length(photon_lines)), min_match_span::Real=min_n_matches <= 2 ? 0.0 : 0.5)
+    solutions = calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches, min_match_span)
+    return select_calibration_solution(solutions; rtol, min_n_matches).c
+end
+
+# Shared by array matching and the bounded histogram discovery search.
+function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches, min_match_span)
     photon_lines = sort(Float64.(photon_lines))
     fPositionX = sort(unique(Float64.(fPositionX)))
     2 <= min_n_matches <= length(photon_lines) || throw(ArgumentError("min_n_matches must lie between 2 and the number of reference lines"))
@@ -109,6 +115,10 @@ function determine_calibration_constant_through_peak_ratios(fPositionX::Array{<:
         converged || continue
         push!(solutions, (; c, n_matches=length(matches.line_indices), score=matches.score))
     end
+    return solutions
+end
+
+function select_calibration_solution(solutions; rtol, min_n_matches)
     isempty(solutions) && error("Insufficient distinct reference-line support for calibration; adjust peak discovery or matching requirements")
     sort!(solutions; by=s -> (-s.n_matches, s.score))
     unique!(s -> s.c, solutions)
@@ -119,101 +129,90 @@ function determine_calibration_constant_through_peak_ratios(fPositionX::Array{<:
         end
     end
     @debug "Calibration identified $(best.n_matches) reference lines with relative RMS residual $(sqrt(best.score))"
-    return best.c
+    return best
 end
 
 
 function _filter_peaks_from_peakfinder(h::Histogram{<:Real, 1}, peakPositions::Vector{T}, σ::Real) where {T <: Real}
     pfits = Vector{@NamedTuple{μ::Real, σ::Real}}(undef, length(peakPositions))
-    success =  Bool.(zeros(length(peakPositions)))
+    # A byte per flag avoids concurrent writes to the same BitArray word.
+    success = fill(false, length(peakPositions))
     Threads.@threads for ipf in eachindex(peakPositions)
         p = peakPositions[ipf]
-        try
-            searchrange = (p - 10σ*step(h.edges[1]), p + 10σ*step(h.edges[1]))
-            h_search = subhist(h, searchrange)
-            # find peak
-            cts_argmax = mapslices(argmax, h_search.weights, dims=1)[1]
-            cts_max    = h_search.weights[cts_argmax]
-            μ = getindex(h_search.edges[1], cts_argmax)
-
-            # find FWHM of peak by interpolation of the two points at which the peak drops below half of its maximum
-            threshold = 0.5
-            left_peak_weights = h_search.weights[1:cts_argmax]
-            cut_left_arg  = findfirst(idx -> left_peak_weights[idx] >= threshold*cts_max && all(left_peak_weights[idx+1:end] .> left_peak_weights[idx]), eachindex(left_peak_weights))
-            left_point1 = (getindex(h_search.edges[1], ifelse(cut_left_arg == 1, cut_left_arg + 1, cut_left_arg -1 )), h_search.weights[ifelse(cut_left_arg == 1, cut_left_arg + 1, cut_left_arg -1 )]) 
-            left_point_2 = (getindex(h_search.edges[1], cut_left_arg), h_search.weights[cut_left_arg])
-            cut_left = _interpolate_linear(left_point1, left_point_2; threshold=threshold*cts_max)
-            right_peak_weights = h_search.weights[cts_argmax:end]
-            cut_right_arg = findfirst(idx -> right_peak_weights[idx] <= threshold*cts_max && all(right_peak_weights[idx+1:end] .< right_peak_weights[idx]), eachindex(right_peak_weights)) + cts_argmax - 1
-            right_point1 = (getindex(h_search.edges[1], cut_right_arg-1), h_search.weights[cut_right_arg-1])
-            right_point2 = (getindex(h_search.edges[1], cut_right_arg), h_search.weights[cut_right_arg])
-            cut_right = _interpolate_linear(right_point1, right_point2; threshold=threshold*cts_max)
-            peak_σ = (cut_right -  cut_left) * inv(2*√(2log(2)))
-            success[ipf] = true
-            pfits[ipf] = (μ = μ, σ = peak_σ)
-        catch e
-            @debug "Error filter peak at $p: $e"
-        end
+        searchrange = (p - 10σ*step(h.edges[1]), p + 10σ*step(h.edges[1]))
+        h_search = subhist(h, searchrange)
+        weights = h_search.weights
+        imax = argmax(weights)
+        centers = StatsBase.midpoints(h_search.edges[1])
+        background = min(first(weights), last(weights))
+        half_height = background + (weights[imax] - background) / 2
+        weights[imax] > half_height || continue
+        left = findlast(<=(half_height), view(weights, 1:imax-1))
+        right_offset = findfirst(<=(half_height), view(weights, imax+1:length(weights)))
+        (isnothing(left) || isnothing(right_offset)) && continue
+        right = imax + right_offset
+        # Nearest adjacent crossings must bracket half-height; never extrapolate.
+        cut_left = _interpolate_linear((centers[left], weights[left]), (centers[left+1], weights[left+1]); threshold=half_height)
+        cut_right = _interpolate_linear((centers[right-1], weights[right-1]), (centers[right], weights[right]); threshold=half_height)
+        peak_σ = (cut_right - cut_left) / (2 * √(2log(2)))
+        success[ipf] = true
+        pfits[ipf] = (μ=centers[imax], σ=peak_σ)
     end
     pfits = pfits[success]
     peakPositions = peakPositions[success]
-    d = map(i -> abs(pfits[i].μ - peakPositions[i]), eachindex(peakPositions));
-    σs = map(f -> f.σ, pfits);   
-    hd = harmmean(d);
-    hσ = harmmean(σs);
-    accepted_peakPositions = T[]
-    for (ipf, pf) in enumerate(pfits)
-        if d[ipf] < 4 * hd && abs(pf.σ) < 2hσ
-            push!(accepted_peakPositions, peakPositions[ipf])
-        end
-    end
-    accepted_peakPositions
+    isempty(peakPositions) && return T[]
+    d = [abs(pfits[i].μ - peakPositions[i]) for i in eachindex(peakPositions)]
+    σs = [f.σ for f in pfits]
+    hd, hσ = harmmean(d), harmmean(σs)
+    # Histogram maxima are quantized; a near-zero distance must not veto
+    # other candidates displaced within one bin.
+    distance_limit = max(4hd, step(h.edges[1]))
+    return peakPositions[(d .<= distance_limit) .& (σs .< 2hσ)]
 end
 
+"""
+    determine_calibration_constant_through_peak_ratios(h, photon_lines; ...)
 
+Search raw deconvolution candidates down to threshold 0.5, using at most the
+`max_n_peaks` strongest candidates per trial. Select the best support and reject
+competing scales. Candidate count alone does not establish calibration support;
+`min_n_peaks` sets the default minimum number of reference matches (at most four).
+Two-match searches retain filtered, first-success discovery for SiPM callers.
+"""
 function determine_calibration_constant_through_peak_ratios(h::Histogram{<:Real, 1, E}, photon_lines::Array{<:Real, 1};
             min_n_peaks::Int = length(photon_lines), max_n_peaks::Int = 5 * length(photon_lines), threshold::Real = 10., α::Real = 0.01, σ::Real = 3.0, rtol::Real = 5e-3,
             min_n_matches::Int = min(4, min_n_peaks, length(photon_lines)), min_match_span::Real = min_n_matches <= 2 ? 0.0 : 0.5) where {E}
-    h_deconv, peakPositions = peakfinder(h, threshold=threshold, σ = σ)
-    fitted_peak_Positions = _filter_peaks_from_peakfinder(h, peakPositions, σ)
+    max_n_peaks >= min_n_matches || throw(ArgumentError("max_n_peaks must allow at least min_n_matches candidates"))
     threshold_reduced = threshold
-    while length(fitted_peak_Positions) > max_n_peaks
-        threshold_reduced *= 1.1
-        if threshold_reduced > 70.0
-            throw(ErrorException("Found too many peaks in the spectrum."))
+    solutions = @NamedTuple{c::Float64, n_matches::Int, score::Float64, threshold::Float64, positions::Vector{Float64}}[]
+    while true
+        h_deconv, peakPositions = peakfinder(h; threshold=threshold_reduced, σ)
+        n_raw = length(peakPositions)
+        if min_n_matches <= 2
+            peakPositions = _filter_peaks_from_peakfinder(h, peakPositions, σ)
         end
-        h_deconv, peakPositions = peakfinder(h, threshold=threshold_reduced, σ = σ)
-        fitted_peak_Positions = _filter_peaks_from_peakfinder(h, peakPositions, σ)
-    end
-    while length(fitted_peak_Positions) < min_n_peaks
-        next_threshold = threshold_reduced * 0.75
-        if next_threshold < 0.5
-            @warn "Could not find enough peaks in the spectrum."
-            break
+        # peakfinder orders candidates by strength; cap work without skipping a
+        # valid solution when a threshold step discovers several extra peaks.
+        resize!(peakPositions, min(length(peakPositions), max_n_peaks))
+        candidates = calibration_solutions(peakPositions, photon_lines; α, rtol, min_n_matches, min_match_span)
+        @debug "Calibration discovery" threshold=threshold_reduced n_raw n_candidates=length(peakPositions) n_solutions=length(candidates)
+        for candidate in candidates
+            push!(solutions, (; candidate..., threshold=Float64(threshold_reduced), positions=peakPositions))
         end
-        threshold_reduced = next_threshold
-        h_deconv, peakPositions = peakfinder(h, threshold=threshold_reduced, σ = σ)
-        fitted_peak_Positions = _filter_peaks_from_peakfinder(h, peakPositions, σ)
+        # SiPM callers use the first two returned positions directly; preserve
+        # their first-success search rather than introducing weaker low peaks.
+        min_n_matches <= 2 && length(peakPositions) >= min_n_peaks && !isempty(candidates) && break
+        threshold_reduced <= 0.5 && break
+        threshold_reduced = max(0.5, threshold_reduced * 0.75)
     end
-    if length(fitted_peak_Positions) < min_n_peaks
-        threshold_reduced = threshold
-        h_deconv, fitted_peak_Positions = peakfinder(h, threshold=threshold_reduced, σ = σ)
-        while length(fitted_peak_Positions) < min_n_peaks
-            next_threshold = threshold_reduced * 0.75
-            if next_threshold < 0.5
-                @warn "Could not find enough peaks in the spectrum."
-                break
-            end
-            threshold_reduced = next_threshold
-            h_deconv, fitted_peak_Positions = peakfinder(h, threshold=threshold_reduced, σ = σ)
-        end
-    end
-    if length(fitted_peak_Positions) < min_n_peaks
-        throw(ErrorException("Could not find enough peaks in the spectrum."))
-    end
-    @debug "Found peak positions at: $fitted_peak_Positions"
-    c = determine_calibration_constant_through_peak_ratios(fitted_peak_Positions, photon_lines; α, rtol, min_n_matches, min_match_span)
-    return c, h_deconv, fitted_peak_Positions, threshold_reduced
+    best = select_calibration_solution(solutions; rtol, min_n_matches)
+    # Return the discovery products from the selected trial, not the final trial.
+    h_deconv, _ = peakfinder(h; threshold=best.threshold, σ)
+    positions = sort(best.positions)
+    lines = sort(photon_lines)
+    matches = match_calibration_lines(positions, lines, best.c; rtol)
+    @debug "Calibration selected" threshold=best.threshold n_candidates=length(positions) matched_lines=lines[matches.line_indices] relative_rms=sqrt(best.score)
+    return best.c, h_deconv, best.positions, best.threshold
 end
 
 function determine_calibration_constant_through_peak_fitting(h::Histogram{<:Real, 1, E}, photon_lines::Vector{<:Real}, c_pre::Real=1.0) where {E}
