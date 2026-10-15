@@ -82,36 +82,41 @@ function _filter_peaks_from_peakfinder(h::Histogram{<:Real, 1}, peakPositions::V
             # find peak
             cts_argmax = mapslices(argmax, h_search.weights, dims=1)[1]
             cts_max    = h_search.weights[cts_argmax]
-            μ = getindex(h_search.edges[1], cts_argmax)
+            centers = StatsBase.midpoints(h_search.edges[1])
+            μ = getindex(centers, cts_argmax)
 
             # find FWHM of peak by interpolation of the two points at which the peak drops below half of its maximum
             threshold = 0.5
             left_peak_weights = h_search.weights[1:cts_argmax]
-            cut_left_arg  = findfirst(idx -> left_peak_weights[idx] >= threshold*cts_max && all(left_peak_weights[idx+1:end] .> left_peak_weights[idx]), eachindex(left_peak_weights))
-            left_point1 = (getindex(h_search.edges[1], ifelse(cut_left_arg == 1, cut_left_arg + 1, cut_left_arg -1 )), h_search.weights[ifelse(cut_left_arg == 1, cut_left_arg + 1, cut_left_arg -1 )]) 
-            left_point_2 = (getindex(h_search.edges[1], cut_left_arg), h_search.weights[cut_left_arg])
-            cut_left = _interpolate_linear(left_point1, left_point_2; threshold=threshold)
+            cut_left_arg = findlast(<=(threshold*cts_max), left_peak_weights)
+            isnothing(cut_left_arg) && continue
+            left_point1 = (getindex(centers, cut_left_arg), h_search.weights[cut_left_arg])
+            left_point_2 = (getindex(centers, cut_left_arg+1), h_search.weights[cut_left_arg+1])
+            cut_left = _interpolate_linear(left_point1, left_point_2; threshold=threshold*cts_max)
             right_peak_weights = h_search.weights[cts_argmax:end]
-            cut_right_arg = findfirst(idx -> right_peak_weights[idx] <= threshold*cts_max && all(right_peak_weights[idx+1:end] .< right_peak_weights[idx]), eachindex(right_peak_weights)) + cts_argmax - 1
-            right_point1 = (getindex(h_search.edges[1], cut_right_arg-1), h_search.weights[cut_right_arg-1])
-            right_point2 = (getindex(h_search.edges[1], cut_right_arg), h_search.weights[cut_right_arg])
-            cut_right = _interpolate_linear(right_point1, right_point2; threshold=threshold)
-            σ = (cut_right -  cut_left) * inv(2*√(2log(2)))
+            cut_right_arg = findfirst(<=(threshold*cts_max), right_peak_weights)
+            isnothing(cut_right_arg) && continue
+            cut_right_arg += cts_argmax - 1
+            right_point1 = (getindex(centers, cut_right_arg-1), h_search.weights[cut_right_arg-1])
+            right_point2 = (getindex(centers, cut_right_arg), h_search.weights[cut_right_arg])
+            cut_right = _interpolate_linear(right_point1, right_point2; threshold=threshold*cts_max)
+            peak_σ = (cut_right -  cut_left) * inv(2*√(2log(2)))
             success[ipf] = true
-            pfits[ipf] = (μ = μ, σ = σ)
+            pfits[ipf] = (μ = μ, σ = peak_σ)
         catch e
             @debug "Error filter peak at $p: $e"
         end
     end
     pfits = pfits[success]
     peakPositions = peakPositions[success]
+    isempty(peakPositions) && return T[]
     d = map(i -> abs(pfits[i].μ - peakPositions[i]), eachindex(peakPositions));
     σs = map(f -> f.σ, pfits);   
     hd = harmmean(d);
     hσ = harmmean(σs);
     accepted_peakPositions = T[]
     for (ipf, pf) in enumerate(pfits)
-        if d[ipf] < 4 * hd && abs(pf.σ) < 2hσ
+        if d[ipf] <= max(4 * hd, step(h.edges[1])) && abs(pf.σ) < 2hσ
             push!(accepted_peakPositions, pf.μ)
         end
     end
@@ -128,17 +133,17 @@ function determine_calibration_constant_through_peak_ratios(h::Histogram{<:Real,
     while length(fitted_peak_Positions) > max_n_peaks
         threshold_reduced *= 1.1
         if threshold_reduced > 70.0
-            throw(ErrorExecption("Found too many peaks in the spectrum."))
+            throw(ErrorException("Found too many peaks in the spectrum."))
         end
         h_deconv, peakPositions = peakfinder(h, threshold=threshold_reduced, σ = σ)
         fitted_peak_Positions = _filter_peaks_from_peakfinder(h, peakPositions, σ)
     end
     while length(fitted_peak_Positions) < min_n_peaks
-        threshold_reduced *= 0.75
-        if threshold_reduced < 0.5
+        if threshold_reduced * 0.75 < 0.5
             @warn "Could not find enough peaks in the spectrum."
             break
         end
+        threshold_reduced *= 0.75
         h_deconv, peakPositions = peakfinder(h, threshold=threshold_reduced, σ = σ)
         fitted_peak_Positions = _filter_peaks_from_peakfinder(h, peakPositions, σ)
     end
@@ -146,11 +151,11 @@ function determine_calibration_constant_through_peak_ratios(h::Histogram{<:Real,
         threshold_reduced = threshold
         h_deconv, fitted_peak_Positions = peakfinder(h, threshold=threshold_reduced, σ = σ)
         while length(fitted_peak_Positions) < min_n_peaks
-            threshold_reduced *= 0.75
-            if threshold_reduced < 0.5
+            if threshold_reduced * 0.75 < 0.5
                 @warn "Could not find enough peaks in the spectrum."
                 break
             end
+            threshold_reduced *= 0.75
             h_deconv, fitted_peak_Positions = peakfinder(h, threshold=threshold_reduced, σ = σ)
         end
     end
@@ -158,8 +163,8 @@ function determine_calibration_constant_through_peak_ratios(h::Histogram{<:Real,
         throw(ErrorException("Could not find enough peaks in the spectrum."))
     end
     @debug "Found peak positions at: $fitted_peak_Positions"
-    c = determine_calibration_constant_through_peak_ratios(peakPositions, photon_lines, α = α, rtol = rtol)
-    return c, h_deconv, peakPositions, threshold
+    c = determine_calibration_constant_through_peak_ratios(fitted_peak_Positions, photon_lines, α = α, rtol = rtol)
+    return c, h_deconv, fitted_peak_Positions, threshold_reduced
 end
 
 function determine_calibration_constant_through_peak_fitting(h::Histogram{<:Real, 1, E}, photon_lines::Vector{<:Real}, c_pre::Real=1.0) where {E}
