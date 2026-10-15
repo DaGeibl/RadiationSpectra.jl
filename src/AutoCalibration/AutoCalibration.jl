@@ -26,12 +26,14 @@ function determine_calibration_constant_through_peak_ratios(fPositionX::Array{<:
     return select_calibration_solution(solutions; rtol, min_n_matches).c
 end
 
-# Sorted, one-to-one matching: maximize support, then minimize relative residuals.
+# Match sorted peaks to sorted references, using each peak and reference at most once.
 function match_calibration_lines(positions, photon_lines, c; rtol)
     n, m = length(positions), length(photon_lines)
     counts = zeros(Int, n + 1, m + 1)
     costs = zeros(Float64, n + 1, m + 1)
     directions = zeros(UInt8, n + 1, m + 1)
+    # For the peaks and references considered so far, keep the most matches; break ties using the smallest total squared relative error.
+    # Record whether we skip a peak (0x01), skip a reference (0x02), or match them (0x03); follow these choices backwards below.
     for i in 1:n, j in 1:m
         count, cost, direction = counts[i, j+1], costs[i, j+1], 0x01
         if counts[i+1, j] > count || (counts[i+1, j] == count && costs[i+1, j] < cost)
@@ -67,7 +69,7 @@ function match_calibration_lines(positions, photon_lines, c; rtol)
     return (; peak_indices, line_indices, score)
 end
 
-# Shared by array matching and the bounded histogram discovery search.
+# Generate proportional gains from peak/reference pairs, then refine their distinct-line assignments.
 function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches, min_match_span)
     photon_lines = sort(Float64.(photon_lines))
     fPositionX = sort(unique(Float64.(fPositionX)))
@@ -76,6 +78,7 @@ function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches
     pcfs = Float64[]
     for i in eachindex(fPositionX), j in i+1:length(fPositionX), it in eachindex(photon_lines), jt in it+1:length(photon_lines)
         if 1 - α <= theo_ratios[it, jt] / exp_ratios[i, j] <= 1 + α
+            # Probe the overlap of both allowed gain intervals, including its boundaries.
             gains = (photon_lines[it] / fPositionX[i], photon_lines[jt] / fPositionX[j])
             c_low = max(0, (1 - rtol) * maximum(gains))
             c_high = (1 + rtol) * minimum(gains)
@@ -90,7 +93,8 @@ function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches
             length(matches.line_indices) >= min_n_matches || break
             peaks, lines = fPositionX[matches.peak_indices], photon_lines[matches.line_indices]
             (last(lines) - first(lines)) >= min_match_span * (last(photon_lines) - first(photon_lines)) || break
-            # Refinement may recover another line; stop only when the assignment stabilizes.
+            # Minimize squared relative residuals while keeping all current matches within tolerance.
+            # Reassign at the refined gain and repeat until the matched pairs stop changing.
             ratios = peaks ./ lines
             c_low = max(0, maximum((1 - rtol) ./ ratios))
             c_high = minimum((1 + rtol) ./ ratios)
@@ -109,11 +113,13 @@ function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches
     return solutions
 end
 
+# Prefer more matched references, then smaller residuals; compare competing gains before accepting the best.
 function select_calibration_solution(solutions; rtol, min_n_matches)
     isempty(solutions) && error("No peaks identified. Try different values for keyword parameters: `α`, `rtol`")
     sort!(solutions; by=s -> (-s.n_matches, s.score))
     unique!(s -> s.c, solutions)
     best = first(solutions)
+    # Two-match searches allow competing gains because different partial reference sequences can fit equally well.
     for other in Iterators.drop(solutions, 1)
         if min_n_matches > 2 && other.n_matches == best.n_matches && !isapprox(other.c, best.c; rtol=rtol) && other.score <= 2 * best.score + eps(Float64)
             error("Ambiguous calibration: competing scales have comparable reference-line support")
@@ -158,8 +164,7 @@ function _filter_peaks_from_peakfinder(h::Histogram{<:Real, 1}, peakPositions::V
     d = [abs(pfits[i].μ - peakPositions[i]) for i in eachindex(peakPositions)]
     σs = [f.σ for f in pfits]
     hd, hσ = harmmean(d), harmmean(σs)
-    # Histogram maxima are quantized; a near-zero distance must not veto
-    # other candidates displaced within one bin.
+    # A peak on a bin center makes the harmonic-mean distance zero; retain a distance tolerance of at least one bin.
     distance_limit = max(4hd, step(h.edges[1]))
     return peakPositions[(d .<= distance_limit) .& (σs .< 2hσ)]
 end
@@ -176,18 +181,18 @@ function determine_calibration_constant_through_peak_ratios(h::Histogram{<:Real,
         if filter_peaks
             peakPositions = _filter_peaks_from_peakfinder(h, peakPositions, σ)
         end
-        # peakfinder orders candidates by strength; cap work without skipping a
-        # valid solution when a threshold step discovers several extra peaks.
+        # Limit matching cost by keeping the strongest discovered peaks.
         resize!(peakPositions, min(length(peakPositions), max_n_peaks))
         candidates = calibration_solutions(peakPositions, photon_lines; α, rtol, min_n_matches, min_match_span)
         @debug "Calibration discovery" threshold=threshold_reduced n_raw n_candidates=length(peakPositions) n_solutions=length(candidates)
         for candidate in candidates
             push!(solutions, (; candidate..., threshold=Float64(threshold_reduced), positions=peakPositions))
         end
-        # SiPM callers use the first two returned positions directly; preserve
-        # their first-success search rather than introducing weaker low peaks.
+        # Two-match searches stop at the first successful threshold to avoid adding unrelated weaker peaks.
+        # Searches requiring more matches compare solutions across all thresholds.
         min_n_matches <= 2 && length(peakPositions) >= min_n_peaks && !isempty(candidates) && break
         if threshold_reduced <= 0.5
+            # Retry without peak-shape filtering if the filtered search found no acceptable solution.
             if filter_peaks && isempty(solutions)
                 filter_peaks = false
                 threshold_reduced = threshold
@@ -198,7 +203,7 @@ function determine_calibration_constant_through_peak_ratios(h::Histogram{<:Real,
         threshold_reduced = max(0.5, threshold_reduced * 0.75)
     end
     best = select_calibration_solution(solutions; rtol, min_n_matches)
-    # Return the discovery products from the selected trial, not the final trial.
+    # The returned discovery output must correspond to the selected solution's threshold.
     h_deconv, _ = peakfinder(h; threshold=best.threshold, σ)
     @debug "Calibration selected" threshold=best.threshold n_candidates=length(best.positions) n_matches=best.n_matches relative_rms=sqrt(best.score)
     return best.c, h_deconv, best.positions, best.threshold
