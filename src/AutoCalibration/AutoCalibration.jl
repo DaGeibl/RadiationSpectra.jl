@@ -8,8 +8,15 @@ function calculate_ratios(pos::Array{T, 1})::Array{T, 2} where {T <: AbstractFlo
     end
     return ratios
 end
+
+# Default number of reference lines that must be matched: all for up to three lines, all but one for four or five, four beyond.
+_default_min_n_matches(n_lines::Int) = min(4, n_lines, max(3, n_lines - 1))
+
+# No span requirement for two-match searches, half of the reference range otherwise.
+_default_min_match_span(min_n_matches::Int) = min_n_matches <= 2 ? 0.0 : 0.5
+
 function determine_calibration_constant_through_peak_ratios(fPositionX::Array{<:Real,1}, photon_lines::Array{<:Real,1};
-        α::Real=0.01, rtol::Real=5e-3, min_n_matches::Int=min(4, length(photon_lines), max(3, length(photon_lines) - 1)), min_match_span::Real=min_n_matches <= 2 ? 0.0 : 0.5)
+        α::Real=0.01, rtol::Real=5e-3, min_n_matches::Int=_default_min_n_matches(length(photon_lines)), min_match_span::Real=_default_min_match_span(min_n_matches))
     solutions = calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches, min_match_span)
     return select_calibration_solution(solutions; rtol, min_n_matches).c
 end
@@ -20,13 +27,16 @@ function match_calibration_lines(positions, photon_lines, c; rtol, min_match_spa
     peak_indices, line_indices = Int[], Int[]
     best_count, best_cost = 0, Inf
     required_span = m == 0 ? 0.0 : min_match_span * (last(photon_lines) - first(photon_lines))
-    # Fix the first matched reference so the span constraint can be checked when choosing the last.
-    # Each prefix retains the most matches, breaking ties by total squared relative error.
+    counts = Matrix{Int}(undef, n + 1, m + 1)
+    costs = Matrix{Float64}(undef, n + 1, m + 1)
+    directions = Matrix{UInt8}(undef, n + 1, m + 1)
+    # One pass per first matched reference line, so the span is known when the last one is chosen.
+    # Each prefix keeps the most matches, ties broken by the sum of squared relative residuals.
     for first_line in 1:m
         photon_lines[end] - photon_lines[first_line] >= required_span || break
-        counts = fill(-1, n + 1, m + 1)
-        costs = fill(Inf, n + 1, m + 1)
-        directions = zeros(UInt8, n + 1, m + 1)
+        fill!(counts, -1)
+        fill!(costs, Inf)
+        fill!(directions, 0x00)
         counts[:, first_line] .= 0
         costs[:, first_line] .= 0
         last_peak, last_line = 0, 0
@@ -76,11 +86,16 @@ function match_calibration_lines(positions, photon_lines, c; rtol, min_match_spa
     return (; peak_indices, line_indices, score)
 end
 
+function _check_matching_arguments(n_lines; rtol, min_n_matches, min_match_span)
+    0 <= rtol < 1 || throw(ArgumentError("rtol must satisfy 0 ≤ rtol < 1"))
+    2 <= min_n_matches <= n_lines || throw(ArgumentError("min_n_matches must be between 2 and the number of reference lines"))
+    0 <= min_match_span <= 1 || throw(ArgumentError("min_match_span must be between 0 and 1"))
+    return nothing
+end
+
 # Generate proportional gains from peak/reference pairs, then refine their distinct-line assignments.
 function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches, min_match_span)
-    0 <= rtol < 1 || throw(ArgumentError("rtol must satisfy 0 ≤ rtol < 1"))
-    2 <= min_n_matches <= length(photon_lines) || throw(ArgumentError("min_n_matches must be between 2 and the number of reference lines"))
-    0 <= min_match_span <= 1 || throw(ArgumentError("min_match_span must be between 0 and 1"))
+    _check_matching_arguments(length(photon_lines); rtol, min_n_matches, min_match_span)
     photon_lines = sort(Float64.(photon_lines))
     fPositionX = sort(unique(Float64.(fPositionX)))
     theo_ratios = calculate_ratios(photon_lines)
@@ -187,45 +202,43 @@ See [`calibrate_spectrum`](@ref) for matching and discovery keywords. Here `thre
 and `max_n_peaks` to `5 * length(photon_lines)`.
 """
 function determine_calibration_constant_through_peak_ratios(h::Histogram{<:Real, 1}, photon_lines::Array{<:Real, 1};
-            min_n_peaks::Int = min(4, length(photon_lines), max(3, length(photon_lines) - 1)), max_n_peaks::Int = 5 * length(photon_lines),
+            min_n_peaks::Int = _default_min_n_matches(length(photon_lines)), max_n_peaks::Int = 5 * length(photon_lines),
             threshold::Real = 10., α::Real = 0.01, σ::Real = 3.0, rtol::Real = 5e-3,
-            min_n_matches::Int = min(4, min_n_peaks, length(photon_lines), max(3, length(photon_lines) - 1)), min_match_span::Real = min_n_matches <= 2 ? 0.0 : 0.5)
+            min_n_matches::Int = min(min_n_peaks, _default_min_n_matches(length(photon_lines))), min_match_span::Real = _default_min_match_span(min_n_matches))
     best = discover_calibration(h, photon_lines; min_n_peaks, max_n_peaks, threshold, α, σ, rtol, min_n_matches, min_match_span)
     return best.c, best.h_deconv, best.positions, best.threshold
 end
 
-# Keep matched references for final fitting without changing the public tuple of discovery diagnostics.
+# Peak-finder thresholds from `threshold` down to 0.5, each three quarters of the previous one.
+function _threshold_sequence(threshold::Real)
+    0 < threshold < 100 || throw(ArgumentError("threshold must be between 0 and 100"))
+    thresholds = Float64[threshold]
+    while last(thresholds) > 0.5
+        push!(thresholds, max(0.5, 0.75 * last(thresholds)))
+    end
+    return thresholds
+end
+
+# Shared by the ratio method and `calibrate_spectrum`, which also needs the matched lines.
 function discover_calibration(h, photon_lines; min_n_peaks, max_n_peaks, threshold, α, σ, rtol, min_n_matches, min_match_span)
     min_n_peaks >= 2 || throw(ArgumentError("min_n_peaks must be at least 2"))
     max_n_peaks >= min_n_matches || throw(ArgumentError("max_n_peaks must be at least min_n_matches"))
-    threshold_reduced = threshold
-    filter_peaks = min_n_matches <= 2
+    _check_matching_arguments(length(photon_lines); rtol, min_n_matches, min_match_span)
+    two_match = min_n_matches <= 2
     solutions = @NamedTuple{c::Float64, n_matches::Int, score::Float64, matched_lines::Vector{Float64}, threshold::Float64, positions::Vector{Float64}, h_deconv::Histogram}[]
-    while true
+    # Two-match searches try the shape-filtered peaks first and stop at the first threshold with a solution.
+    # Searches for more matches use all peaks and collect the solutions of all thresholds.
+    for filter_peaks in (two_match ? (true, false) : (false,)), threshold_reduced in _threshold_sequence(threshold)
         h_deconv, peakPositions = peakfinder(h; threshold=threshold_reduced, σ)
-        n_raw = length(peakPositions)
-        candidates = filter_peaks ? _filter_peaks_from_peakfinder(h, peakPositions, σ) : copy(peakPositions)
-        # Limit matching cost by keeping the strongest discovered peaks; preserve raw return positions.
-        resize!(candidates, min(length(candidates), max_n_peaks))
+        length(peakPositions) >= min_n_peaks || continue
+        candidates = first(filter_peaks ? _filter_peaks_from_peakfinder(h, peakPositions, σ) : peakPositions, max_n_peaks)
         found = calibration_solutions(candidates, photon_lines; α, rtol, min_n_matches, min_match_span)
-        @debug "Calibration discovery" threshold=threshold_reduced n_raw n_candidates=length(candidates) n_solutions=length(found)
-        if n_raw >= min_n_peaks
-            for candidate in found
-                push!(solutions, (; candidate..., threshold=Float64(threshold_reduced), positions=peakPositions, h_deconv))
-            end
-            min_n_matches <= 2 && !isempty(found) && break
+        @debug "Calibration discovery" threshold=threshold_reduced n_raw=length(peakPositions) n_candidates=length(candidates) n_solutions=length(found)
+        for candidate in found
+            push!(solutions, (; candidate..., threshold=Float64(threshold_reduced), positions=peakPositions, h_deconv))
         end
-        if threshold_reduced <= 0.5
-            if filter_peaks && isempty(solutions)
-                filter_peaks = false
-                threshold_reduced = threshold
-                continue
-            end
-            break
-        end
-        threshold_reduced = max(0.5, threshold_reduced * 0.75)
+        two_match && !isempty(found) && break
     end
-    # More matches can justify a lower threshold; ties prefer the highest threshold to suppress noise competitors.
     best = select_calibration_solution(solutions; rtol, min_n_matches)
     @debug "Calibration selected" threshold=best.threshold n_raw=length(best.positions) n_matches=best.n_matches relative_rms=sqrt(best.score)
     return best
@@ -293,9 +306,9 @@ the selected threshold raise an ambiguity error. Two-match searches stop at the 
 Missing-line subsets must still satisfy `min_match_span`; lower it when using a narrow reference subset.
 """
 function calibrate_spectrum(h_uncal::Histogram{<:Real, 1}, photon_lines::Vector{<:Real};
-            σ::Real = 3.0, threshold::Real = 50.0, min_n_peaks::Int = min(4, length(photon_lines), max(3, length(photon_lines) - 1)),
+            σ::Real = 3.0, threshold::Real = 50.0, min_n_peaks::Int = _default_min_n_matches(length(photon_lines)),
             max_n_peaks::Int = 4 * length(photon_lines), α::Real = 0.01, rtol::Real = 5e-3,
-            min_n_matches::Int = min(4, min_n_peaks, length(photon_lines), max(3, length(photon_lines) - 1)), min_match_span::Real = min_n_matches <= 2 ? 0.0 : 0.5)
+            min_n_matches::Int = min(min_n_peaks, _default_min_n_matches(length(photon_lines))), min_match_span::Real = _default_min_match_span(min_n_matches))
     best = discover_calibration(h_uncal, photon_lines; min_n_peaks, max_n_peaks, threshold, α, σ, rtol, min_n_matches, min_match_span)
     c_precal = best.c
     c = determine_calibration_constant_through_peak_fitting(h_uncal, best.matched_lines, c_precal)[1]
