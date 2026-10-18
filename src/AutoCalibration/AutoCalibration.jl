@@ -21,7 +21,7 @@ function determine_calibration_constant_through_peak_ratios(fPositionX::Array{<:
     return select_calibration_solution(solutions; rtol, min_n_matches).c
 end
 
-# Match sorted peaks to sorted references, using each peak and reference at most once.
+# Monotone one-to-one matching of sorted peaks to sorted reference lines at gain `c`.
 function match_calibration_lines(positions, photon_lines, c; rtol, min_match_span=0.0)
     n, m = length(positions), length(photon_lines)
     peak_indices, line_indices = Int[], Int[]
@@ -60,7 +60,7 @@ function match_calibration_lines(positions, photon_lines, c; rtol, min_match_spa
             counts[i+1, j+1], costs[i+1, j+1], directions[i+1, j+1] = count, cost, direction
         end
         last_peak == 0 && continue
-        # The final pair is forced; its prefix follows the ordinary optimal-assignment choices.
+        # Walk back from the chosen last pair along the stored decisions.
         empty!(peak_indices)
         empty!(line_indices)
         push!(peak_indices, last_peak)
@@ -93,7 +93,7 @@ function _check_matching_arguments(n_lines; rtol, min_n_matches, min_match_span)
     return nothing
 end
 
-# Generate proportional gains from peak/reference pairs, then refine their distinct-line assignments.
+# Candidate gains from pairs of peaks whose ratio matches a pair of reference lines, each refined by least squares on its matches.
 function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches, min_match_span)
     _check_matching_arguments(length(photon_lines); rtol, min_n_matches, min_match_span)
     photon_lines = sort(Float64.(photon_lines))
@@ -103,7 +103,7 @@ function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches
     pcfs = Float64[]
     for i in eachindex(fPositionX), j in i+1:length(fPositionX), it in eachindex(photon_lines), jt in it+1:length(photon_lines)
         if 1 - α <= theo_ratios[it, jt] / exp_ratios[i, j] <= 1 + α
-            # Probe the overlap of both allowed gain intervals, including its boundaries.
+            # Probe the overlap of the two gain intervals at its ends and in the middle.
             gains = (photon_lines[it] / fPositionX[i], photon_lines[jt] / fPositionX[j])
             c_low = max(0, (1 - rtol) * maximum(gains))
             c_high = (1 + rtol) * minimum(gains)
@@ -117,8 +117,8 @@ function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches
         for iteration in eachindex(photon_lines)
             length(matches.line_indices) >= min_n_matches || break
             peaks, lines = fPositionX[matches.peak_indices], photon_lines[matches.line_indices]
-            # Minimize squared relative residuals while keeping all current matches within tolerance.
-            # Reassign at the refined gain and repeat until the matched pairs stop changing.
+            # Least-squares gain over the current matches, clamped so that they all stay within tolerance.
+            # Rematch at that gain and repeat until the assignment is stable.
             ratios = peaks ./ lines
             c_low = max(0, maximum((1 - rtol) ./ ratios))
             c_high = minimum((1 + rtol) ./ ratios)
@@ -137,13 +137,14 @@ function calibration_solutions(fPositionX, photon_lines; α, rtol, min_n_matches
     return solutions
 end
 
-# Prefer more matched references, then higher thresholds and smaller residuals; check competing gains.
+# Most matches first, then the highest threshold, then the smallest residuals.
 function select_calibration_solution(solutions; rtol, min_n_matches)
     isempty(solutions) && error("No peaks identified. Try different values for keyword parameters: `α`, `rtol`")
     sort!(solutions; by=s -> (-s.n_matches, -get(s, :threshold, 0.0), s.score))
     unique!(s -> s.c, solutions)
     best = first(solutions)
-    # Two-match searches allow competing gains because different partial reference sequences can fit equally well.
+    # A competing gain with equal support at the selected threshold is an error, except in two-match searches,
+    # where other pairs of lines fit the same peaks about as well.
     for other in Iterators.drop(solutions, 1)
         if min_n_matches > 2 && other.n_matches == best.n_matches && get(other, :threshold, 0.0) == get(best, :threshold, 0.0) && !isapprox(other.c, best.c; rtol=rtol) && other.score <= 2 * best.score + eps(Float64)
             error("Ambiguous calibration: competing scales have comparable reference-line support")
@@ -172,7 +173,7 @@ function _filter_peaks_from_peakfinder(h::Histogram{<:Real, 1}, peakPositions::V
             right_offset = findfirst(<=(half_height), view(weights, imax+1:length(weights)))
             (isnothing(left) || isnothing(right_offset)) && continue
             right = imax + right_offset
-            # Nearest adjacent crossings must bracket half-height; never extrapolate.
+            # Interpolate the half-height crossings between the bracketing bins.
             cut_left = _interpolate_linear((centers[left], weights[left]), (centers[left+1], weights[left+1]); threshold=half_height)
             cut_right = _interpolate_linear((centers[right-1], weights[right-1]), (centers[right], weights[right]); threshold=half_height)
             peak_σ = (cut_right - cut_left) / (2 * √(2log(2)))
@@ -188,7 +189,7 @@ function _filter_peaks_from_peakfinder(h::Histogram{<:Real, 1}, peakPositions::V
     d = [abs(pfits[i].μ - peakPositions[i]) for i in eachindex(peakPositions)]
     σs = [f.σ for f in pfits]
     hd, hσ = harmmean(d), harmmean(σs)
-    # A peak on a bin center makes the harmonic-mean distance zero; retain a distance tolerance of at least one bin.
+    # A peak exactly on a bin center makes the harmonic mean distance zero, so allow at least one bin.
     distance_limit = max(4hd, step(h.edges[1]))
     return peakPositions[(d .<= distance_limit) .& (σs .< 2hσ)]
 end
@@ -196,10 +197,13 @@ end
 """
     determine_calibration_constant_through_peak_ratios(h::Histogram, photon_lines; kwargs...)
 
-Return `(c, h_deconv, peak_positions, threshold)` for the proportional calibration `energy = c * position`.
-`peak_positions` contains all raw peak-finder positions at the selected threshold, in strength order.
-See [`calibrate_spectrum`](@ref) for matching and discovery keywords. Here `threshold` defaults to 10
-and `max_n_peaks` to `5 * length(photon_lines)`.
+Estimate the calibration constant `c` in `energy = c * position` from the ratios of the peak
+positions in `h` and of the reference lines `photon_lines`.
+
+Returns `(c, h_deconv, peak_positions, threshold)`: the calibration constant, the deconvolved
+spectrum, the raw peak-finder positions at the selected `threshold` (strongest first) and that
+threshold. Takes the keyword arguments of [`calibrate_spectrum`](@ref), except that `threshold`
+defaults to 10 and `max_n_peaks` to `5 * length(photon_lines)`.
 """
 function determine_calibration_constant_through_peak_ratios(h::Histogram{<:Real, 1}, photon_lines::Array{<:Real, 1};
             min_n_peaks::Int = _default_min_n_matches(length(photon_lines)), max_n_peaks::Int = 5 * length(photon_lines),
@@ -285,25 +289,32 @@ end
 """
     calibrate_spectrum(h_uncal::Histogram, photon_lines::Vector{<:Real}; kwargs...)
 
-Calibrate with `energy = c * position`: discover peaks, identify reference matches, then fit only
-those lines with Gaussian peaks and a linear background to refine the gain (offset fixed to zero).
-Return `(h_cal, h_deconv, peak_positions, threshold, c, c_precal)`. Positions are all raw,
-uncalibrated peak-finder positions at the selected threshold, in strength order.
+Calibrate the spectrum `h_uncal` with `energy = c * position`. Peaks are found with `peakfinder`
+and matched to the reference lines `photon_lines` through the ratios of their positions, then `c`
+is refined by fitting the matched lines with Gaussian peaks on a linear background (offset fixed
+to zero).
+
+Returns `(h_cal, h_deconv, peak_positions, threshold, c, c_precal)`: the calibrated histogram,
+the deconvolved spectrum, the raw peak-finder positions at the selected `threshold` (strongest
+first), that threshold, the fitted calibration constant and its estimate from the peak ratios.
 
 # Keywords
-- `σ::Real = 3.0`: Expected peak sigma, in bins.
-- `threshold::Real = 50.0`: Initial peak-finder threshold, a percentage between 0 and 100; reduced down to 0.5 to discover weaker peaks.
-- `min_n_peaks::Int`: Required raw discovery count; defaults to 2 for two references, 3 for three or four, and 4 for larger lists. Also caps the default `min_n_matches` for existing callers requesting two-peak searches.
-- `max_n_peaks::Int = 4 * length(photon_lines)`: Match only this many strongest candidates; does not truncate returned positions.
-- `min_n_matches::Int`: Required distinct reference matches; defaults as above, capped by `min_n_peaks`. Set explicitly to require more or fewer matches (at least two).
-- `min_match_span::Real = min_n_matches <= 2 ? 0.0 : 0.5`: Minimum matched energy span as a fraction of the full reference span, between 0 and 1.
-- `α::Real = 0.01`: Relative tolerance when comparing a reference-pair ratio with a discovered peak-pair ratio.
-- `rtol::Real = 5e-3`: Maximum relative line residual, `abs(c * position - line) / line`; must satisfy `0 ≤ rtol < 1`. Small values are needed to discriminate nearby lines.
+- `σ::Real = 3.0`: expected standard deviation of the peaks in bins.
+- `threshold::Real = 50.0`: initial peak-finder threshold in percent, lowered by a quarter per step and finally to 0.5 to find weaker peaks.
+- `min_n_peaks::Int`: minimum number of peaks the peak finder has to report. Defaults to 2 for two reference lines, 3 for three or four, and 4 for more. Also caps the default `min_n_matches`.
+- `max_n_peaks::Int = 4 * length(photon_lines)`: only the strongest `max_n_peaks` peaks (after the shape filter of two-match searches) take part in the matching. Does not truncate the returned positions.
+- `min_n_matches::Int`: minimum number of reference lines that must be matched, at least 2. Defaults to the same values as `min_n_peaks`, capped by it.
+- `min_match_span::Real = min_n_matches <= 2 ? 0.0 : 0.5`: minimum energy range of the matched lines as a fraction of the range of `photon_lines`.
+- `α::Real = 0.01`: relative tolerance when comparing the ratio of two peak positions with the ratio of two reference lines.
+- `rtol::Real = 5e-3`: maximum relative residual `abs(c * position - line) / line` of a matched peak, in `[0, 1)`. Keep it small to tell nearby lines apart.
 
-Solutions prefer more matched references, then higher discovery thresholds, then smaller squared
-relative residuals. For more than two required matches, comparably supported competing gains at
-the selected threshold raise an ambiguity error. Two-match searches stop at the first successful threshold.
-Missing-line subsets must still satisfy `min_match_span`; lower it when using a narrow reference subset.
+Of the solutions found, the one with the most matched lines wins, then the one found at the
+highest threshold, then the one with the smallest residuals. With more than two required matches,
+a competing gain with comparable support at the selected threshold raises an error. Two-match
+searches first match only the peaks that pass a shape filter, fall back to all peaks, and stop at
+the first threshold that yields a solution. Lines missing from the spectrum are tolerated as long
+as `min_n_peaks`, `min_n_matches` and `min_match_span` are met, so lower `min_match_span` when the
+lines expected in the spectrum cover only a small part of the range of `photon_lines`.
 """
 function calibrate_spectrum(h_uncal::Histogram{<:Real, 1}, photon_lines::Vector{<:Real};
             σ::Real = 3.0, threshold::Real = 50.0, min_n_peaks::Int = _default_min_n_matches(length(photon_lines)),
